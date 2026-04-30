@@ -16,6 +16,15 @@
 # on. Most rules below are scoped to [Bash] because their patterns describe
 # shell commands — without this scope, a Write of a SQL migration containing
 # `DROP DATABASE` would trip a hard-stop. Default (omitted) = all tools.
+#
+# Regex notes:
+#   - Patterns are evaluated case-insensitive (re.IGNORECASE).
+#   - \b silently does NOT match between two non-word chars. `\b--force\b`
+#     looks right but never fires when `--force` is preceded by space (both
+#     space and `-` are non-word). Use `\s` before flags, not `\b`.
+#   - Plurals: `\bnamespace\b` won't match `namespaces` (s and e are both
+#     word chars, no boundary). Either spell out plurals or drop the trailing
+#     \b and accept the prefix-match.
 
 judge:
   enabled: true
@@ -33,26 +42,37 @@ audit:
 # These should be operations no autonomous agent should EVER perform.
 # ─────────────────────────────────────────────────────────────────────────
 hard_stop:
-  # Filesystem catastrophes
+  # Filesystem catastrophes.
+  # Lookahead requires a recursive/force flag anywhere in the command (matches
+  # short-form bundles like -rf/-Rf/-rfv AND long forms like --recursive).
+  # Main pattern then requires `/` as a target (with optional quotes).
   - name: rm_rf_root
-    pattern: 'rm\s+-[rRf]+\s+/(\s|$)'
+    pattern: 'rm\b(?=.*\s(--recursive\b|--force\b|-[a-zA-Z]*[rR][a-zA-Z]*\b)).*\s["'']?/["'']?(\s|$)'
     reason: "rm -rf on root filesystem"
     applies_to: [Bash]
 
   - name: rm_rf_home
-    pattern: 'rm\s+-[rRf]+\s+["'']?(\$HOME|~)["'']?(\s|/|$)'
+    pattern: 'rm\b(?=.*\s(--recursive\b|--force\b|-[a-zA-Z]*[rR][a-zA-Z]*\b)).*\s["'']?(\$HOME|~)["'']?(\s|/|$)'
     reason: "rm -rf on home directory"
     applies_to: [Bash]
 
   # Git destructive ops on protected branches.
   # Two lookaheads so flag/branch order doesn't matter:
   # `git push --force origin main` AND `git push origin main --force` both match.
+  # Also catches the `+main` refspec form (force update) and -f short flag.
   # Note: \s before --force, NOT \b — \b doesn't fire between two non-word
   # chars (space and dash), which silently breaks the obvious-looking
   # \b(--force|-f)\b form.
   - name: force_push_protected
-    pattern: 'git\s+push\b(?=.*\s(--force|-f)\b)(?=.*\b(main|master|prod|production|release)\b)'
+    pattern: 'git\s+push\b(?=.*(\s\+|\s(--force|-f)\b))(?=.*\b(main|master|prod|production|release)\b)'
     reason: "Force push to protected branch"
+    applies_to: [Bash]
+
+  # Remote branch deletion on a protected branch (`git push origin :main` and
+  # `git push origin --delete main` both delete the remote ref).
+  - name: delete_protected_remote_branch
+    pattern: 'git\s+push\b.*(\s:|\s--delete\s+)(refs/heads/)?(main|master|prod|production|release)\b'
+    reason: "Delete protected remote branch"
     applies_to: [Bash]
 
   - name: git_hard_reset_protected
@@ -67,18 +87,19 @@ hard_stop:
     applies_to: [Bash]
 
   - name: dropdb_cli
-    pattern: '(^|[\s;|&])dropdb\s+\w'
+    pattern: '(^|[\s;|&])dropdb\s+\S'
     reason: "PostgreSQL dropdb command"
     applies_to: [Bash]
 
   - name: truncate_table
-    pattern: '\bTRUNCATE\s+(TABLE\s+)?\w'
+    pattern: '\bTRUNCATE\s+(TABLE\s+)?["`'']?\w'
     reason: "SQL TRUNCATE TABLE"
     applies_to: [Bash]
 
-  # Railway (the incident motivator)
+  # Railway (the incident motivator).
+  # `volumes?` so railway volume delete AND railway volumes delete both match.
   - name: railway_volume_delete_cli
-    pattern: 'railway\s+volume\s+(delete|remove|destroy)'
+    pattern: 'railway\s+volumes?\s+(delete|remove|destroy)'
     reason: "Railway volume deletion via CLI"
     applies_to: [Bash]
 
@@ -88,13 +109,15 @@ hard_stop:
     applies_to: [Bash, WebFetch]
 
   - name: railway_project_delete
-    pattern: 'railway\s+(project|environment)\s+delete'
+    pattern: 'railway\s+(projects?|environments?|envs?)\s+(delete|remove|destroy)'
     reason: "Railway project/environment deletion"
     applies_to: [Bash]
 
-  # Kubernetes
+  # Kubernetes.
+  # `namespaces?` for plural; `(namespace|namespaces|ns)` would also work but
+  # the trailing \b is fine here because we listed both forms explicitly.
   - name: kubectl_delete_namespace
-    pattern: 'kubectl\s+(delete|destroy)\s+(namespace|ns)\b'
+    pattern: 'kubectl\s+(delete|destroy)\s+(namespaces?|ns)\b'
     reason: "Kubernetes namespace deletion"
     applies_to: [Bash]
 
@@ -103,25 +126,27 @@ hard_stop:
     reason: "Kubernetes mass delete"
     applies_to: [Bash]
 
-  # Terraform / OpenTofu
+  # Terraform / OpenTofu.
+  # Order-independent for `apply -destroy -auto-approve` vs `apply -auto-approve -destroy`.
   - name: terraform_destroy_auto
-    pattern: '\b(terraform|tofu)\s+destroy\s+.*-auto-approve'
+    pattern: '\b(terraform|tofu)\s+destroy\b(?=.*\s-auto-approve\b)'
     reason: "Terraform/OpenTofu destroy with auto-approve"
     applies_to: [Bash]
 
   - name: terraform_apply_auto_destroy
-    pattern: '\b(terraform|tofu)\s+apply\s+.*-destroy.*-auto-approve'
+    pattern: '\b(terraform|tofu)\s+apply\b(?=.*\s-destroy\b)(?=.*\s-auto-approve\b)'
     reason: "Terraform destroy via apply -destroy -auto-approve"
     applies_to: [Bash]
 
   # Cloud platform - root-level destruction
   - name: aws_delete_bucket_force
-    pattern: 'aws\s+s3\s+rb\s+.*--force'
+    pattern: 'aws\s+s3\s+rb\s+.*\s--force\b'
     reason: "AWS S3 force-delete bucket"
     applies_to: [Bash]
 
+  # `projects?` — gcloud uses plural but agents often write singular.
   - name: gcloud_project_delete
-    pattern: 'gcloud\s+projects\s+delete'
+    pattern: 'gcloud\s+projects?\s+delete'
     reason: "GCP project deletion"
     applies_to: [Bash]
 
@@ -135,15 +160,17 @@ hard_stop:
     reason: "Heroku app destroy"
     applies_to: [Bash]
 
-  # Privilege escalation patterns
+  # Privilege escalation patterns.
+  # Three lookaheads so 777/recursive-flag/path-`/` can appear in any order.
   - name: chmod_777_recursive
-    pattern: 'chmod\s+-R\s+777\s+/'
+    pattern: 'chmod\b(?=.*\b777\b)(?=.*\s(--recursive\b|-[a-zA-Z]*[rR][a-zA-Z]*\b))(?=.*\s/(\s|$))'
     reason: "Recursive chmod 777 from root"
     applies_to: [Bash]
 
-  - name: curl_pipe_sh_root
-    pattern: 'curl\s+.*\|\s*sudo\s+(bash|sh)'
-    reason: "curl piped to sudo shell"
+  # Widened beyond curl|sudo: wget, fetch, optional sudo, sh/bash/zsh.
+  - name: pipe_to_shell
+    pattern: '(curl|wget|fetch)\s+.*\|\s*(sudo\s+)?(bash|sh|zsh)\b'
+    reason: "Downloaded content piped to a shell"
     applies_to: [Bash]
 
 
@@ -161,7 +188,7 @@ soft_match:
 
   # Curl to known infrastructure APIs (catches the Railway-style bypass)
   - name: curl_infrastructure_api
-    pattern: 'curl\s+.*(api\.railway\.app|railway\.com/graphql|api\.vercel\.com|api\.fly\.io|api\.heroku\.com|api\.digitalocean\.com|api\.linode\.com)'
+    pattern: '(curl|wget|http)\s+.*(api\.railway\.app|railway\.com/graphql|api\.vercel\.com|api\.fly\.io|api\.heroku\.com|api\.digitalocean\.com|api\.linode\.com)'
     reason: "HTTP call to infrastructure provider API"
     applies_to: [Bash]
 
@@ -171,65 +198,81 @@ soft_match:
     reason: "WebFetch to infrastructure provider API"
     applies_to: [WebFetch]
 
-  # Recursive removal (less catastrophic than rm -rf /)
+  # Recursive removal — accepts any flag bundle containing r/R, plus --recursive.
+  # Old pattern `rm\s+-[rR][fF]?\b` silently missed `-rfv` (the \b fails
+  # between two word chars f and v) and `-fR` (locked first-char order).
   - name: rm_recursive
-    pattern: 'rm\s+-[rR][fF]?\b'
+    pattern: 'rm\b(?=.*\s(--recursive\b|-[a-zA-Z]*[rR][a-zA-Z]*\b))'
     reason: "Recursive rm"
     applies_to: [Bash]
 
-  # AWS / GCP / Azure delete operations
+  # AWS / GCP / Azure delete operations.
+  # Old aws_delete_op required exactly `aws WORD delete-...` and missed
+  # `aws --region X s3 delete-...`. Loosened to "delete-action follows a
+  # word that follows the CLI invocation".
   - name: aws_delete_op
-    pattern: 'aws\s+\w+\s+(delete-|terminate-|remove-)'
+    pattern: 'aws\b.*\s\w+\s+(delete-|terminate-|remove-|destroy-)'
     reason: "AWS CLI destructive operation"
     applies_to: [Bash]
 
+  # Loosened to allow any subcommand depth (gcloud projects delete,
+  # gcloud compute instances delete, gcloud compute disks delete, etc.).
   - name: gcloud_delete_op
-    pattern: 'gcloud\s+\w+\s+\w+\s+delete\b'
+    pattern: 'gcloud\b.*\s\w+\s+(delete|destroy|remove)\b'
     reason: "GCP CLI destructive operation"
     applies_to: [Bash]
 
+  # Same — old `az\s+\w+\s+delete\b` missed `az storage account delete`.
   - name: az_delete_op
-    pattern: 'az\s+\w+\s+delete\b'
+    pattern: 'az\b.*\s\w+\s+(delete|destroy|purge)\b'
     reason: "Azure CLI destructive operation"
     applies_to: [Bash]
 
   # Database - non-DROP destructive ops
   - name: sql_delete_no_where
-    pattern: '\bDELETE\s+FROM\s+\w+\s*(;|$)'
+    pattern: '\bDELETE\s+FROM\s+["`'']?\w+["`'']?\s*(;|$)'
     reason: "SQL DELETE without WHERE clause"
     applies_to: [Bash]
 
-  # Docker / container ops
+  # Docker / container ops.
+  # Now covers system|container|volume|network|image|builder prune.
   - name: docker_system_prune
-    pattern: 'docker\s+(system\s+)?prune\s+.*(-a|--all|--volumes)'
+    pattern: 'docker\s+((system|container|volume|network|image|builder)\s+)?prune\b.*\s(-a\b|-af\b|-fa\b|--all\b|--volumes\b)'
     reason: "Aggressive docker prune"
     applies_to: [Bash]
 
+  # Now covers `docker rm`, `docker rmi`, and `docker {container|volume|
+  # network|image|service} rm`, plus `--force` long flag (not just `-f`).
   - name: docker_rm_force
-    pattern: 'docker\s+(container\s+)?rm\s+.*-f'
+    pattern: 'docker\s+((container|volume|network|image|service)\s+rm|rm|rmi)\b.*\s(-[a-zA-Z]*f[a-zA-Z]*\b|--force\b)'
     reason: "Force docker container removal"
     applies_to: [Bash]
 
   # Git - less catastrophic but still risky
   - name: git_clean_force
-    pattern: 'git\s+clean\s+.*-[fdx]'
+    pattern: 'git\s+clean\b.*\s(-[a-zA-Z]*[fdx][a-zA-Z]*\b|--force\b)'
     reason: "git clean with force/dirs/ignored"
     applies_to: [Bash]
 
+  # Catches both `git branch -D x` AND the colon-prefix delete form
+  # `git push origin :x` (and `--delete`).
   - name: git_branch_delete
-    pattern: 'git\s+(branch|push)\s+.*(-D|--delete)'
+    pattern: 'git\s+branch\b.*\s(-D\b|--delete\b)|git\s+push\b.*(\s:[\w/.-]|\s--delete\b)'
     reason: "Git branch/remote deletion"
     applies_to: [Bash]
 
-  # Kubernetes - non-namespace deletes
+  # Kubernetes resource deletion. Spelled-out plurals + abbreviations to
+  # avoid the \b-after-singular silent fail (kubectl delete deployments
+  # didn't match `\bdeployment\b` because `t→s` isn't a word boundary).
   - name: kubectl_delete_resource
-    pattern: 'kubectl\s+delete\s+(deployment|statefulset|pvc|persistentvolume|secret)\b'
+    pattern: 'kubectl\s+delete\s+(deployments?|deploy|statefulsets?|sts|pvcs?|persistentvolumes?|pv|secrets?|services?|svc|configmaps?|cm|jobs?|cronjobs?|daemonsets?|ds|replicasets?|rs|pods?|po)\b'
     reason: "Kubernetes resource deletion"
     applies_to: [Bash]
 
-  # Direct DB connections to non-localhost
+  # Direct DB connections to non-localhost. Now covers `--host`/`--host=`
+  # in addition to `-h`.
   - name: psql_remote
-    pattern: 'psql\s+.*-h\s+(?!localhost|127\.0\.0\.1)'
+    pattern: 'psql\b.*\s(-h\s+|--host[\s=]+)(?!localhost\b|127\.0\.0\.1\b)\S'
     reason: "psql connection to remote host"
     applies_to: [Bash]
 

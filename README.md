@@ -228,8 +228,31 @@ Failure modes:
 agent-guardrail/
 ├── guardrail.py            # the hook (single file)
 ├── config.example.yaml     # default rules + judge config
+├── tests/
+│   └── test_rules.py       # adversarial test suite for the rule set
 └── README.md               # this file
 ```
+
+## Tests
+
+`tests/test_rules.py` exercises every rule with three case categories:
+
+- **POSITIVE** — input that should match
+- **REGRESSION** — input that *looks* like it should match but didn't, in a
+  prior version of the regex. Each one corresponds to a fixed silent-fail
+  bug; kept here so a future regex rewrite can't re-introduce it
+- **TRUE_NEG** — input that should NOT match (don't over-block)
+
+```bash
+python3 tests/test_rules.py
+```
+
+The REGRESSION column is the important one. `\b` against punctuation,
+plural suffixes, and flag-order variants are the recurring silent-fail
+class — `force_push_protected` shipped with one of these for v1's lifetime.
+Most regex test suites only cover POSITIVE, which leaves these bugs
+invisible. When adding a rule, add at least one TRUE_NEG case alongside
+the POSITIVE one.
 
 ## License
 
