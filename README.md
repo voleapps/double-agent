@@ -27,7 +27,7 @@ etc.), this hook intercepts the call and runs it through a 3-layer pipeline:
 Blocks return a structured rejection message designed to discourage the agent
 from looping through workarounds.
 
-!![image](https://voleapps.com/github/doubleagent-graph.webp)
+![image](https://voleapps.com/github/doubleagent-graph.webp)
 
 ## Why this matters
 
