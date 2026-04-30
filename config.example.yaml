@@ -1,0 +1,254 @@
+# Agent Guardrail - configuration
+#
+# Place this file at one of:
+#   ./.guardrail.yaml             (project-level, highest priority)
+#   ~/.config/guardrail/config.yaml (user-level)
+#   /etc/guardrail/config.yaml      (system-level)
+#
+# Pipeline:
+#   1. hard_stop  - regex matches → BLOCK immediately, no judge consulted
+#   2. soft_match - regex matches → call judge for evaluation
+#   3. judge      - LLM evaluates against rules_for_judge with paranoid posture
+#
+# Anything not matched by hard_stop or soft_match is allowed.
+#
+# Per-rule `applies_to` (optional): restricts which tool types the rule fires
+# on. Most rules below are scoped to [Bash] because their patterns describe
+# shell commands — without this scope, a Write of a SQL migration containing
+# `DROP DATABASE` would trip a hard-stop. Default (omitted) = all tools.
+
+judge:
+  enabled: true
+  model: claude-haiku-4-5-20251001  # small/fast model recommended
+  max_tokens: 250
+  timeout_seconds: 15  # cap on each judge API call; falls through as ESCALATE on timeout
+
+audit:
+  enabled: true
+  max_size_mb: 10     # rotate audit.log when it exceeds this
+  backup_count: 3     # keep audit.log.1 .. audit.log.N
+
+# ─────────────────────────────────────────────────────────────────────────
+# HARD STOP - never allowed, no override path, no judge
+# These should be operations no autonomous agent should EVER perform.
+# ─────────────────────────────────────────────────────────────────────────
+hard_stop:
+  # Filesystem catastrophes
+  - name: rm_rf_root
+    pattern: 'rm\s+-[rRf]+\s+/(\s|$)'
+    reason: "rm -rf on root filesystem"
+    applies_to: [Bash]
+
+  - name: rm_rf_home
+    pattern: 'rm\s+-[rRf]+\s+["'']?(\$HOME|~)["'']?(\s|/|$)'
+    reason: "rm -rf on home directory"
+    applies_to: [Bash]
+
+  # Git destructive ops on protected branches.
+  # Two lookaheads so flag/branch order doesn't matter:
+  # `git push --force origin main` AND `git push origin main --force` both match.
+  # Note: \s before --force, NOT \b — \b doesn't fire between two non-word
+  # chars (space and dash), which silently breaks the obvious-looking
+  # \b(--force|-f)\b form.
+  - name: force_push_protected
+    pattern: 'git\s+push\b(?=.*\s(--force|-f)\b)(?=.*\b(main|master|prod|production|release)\b)'
+    reason: "Force push to protected branch"
+    applies_to: [Bash]
+
+  - name: git_hard_reset_protected
+    pattern: 'git\s+reset\s+--hard\s+.*\b(main|master|prod|production)\b'
+    reason: "Hard reset on protected branch"
+    applies_to: [Bash]
+
+  # Database
+  - name: drop_database_sql
+    pattern: '\bDROP\s+(DATABASE|SCHEMA)\b'
+    reason: "SQL DROP DATABASE/SCHEMA"
+    applies_to: [Bash]
+
+  - name: dropdb_cli
+    pattern: '(^|[\s;|&])dropdb\s+\w'
+    reason: "PostgreSQL dropdb command"
+    applies_to: [Bash]
+
+  - name: truncate_table
+    pattern: '\bTRUNCATE\s+(TABLE\s+)?\w'
+    reason: "SQL TRUNCATE TABLE"
+    applies_to: [Bash]
+
+  # Railway (the incident motivator)
+  - name: railway_volume_delete_cli
+    pattern: 'railway\s+volume\s+(delete|remove|destroy)'
+    reason: "Railway volume deletion via CLI"
+    applies_to: [Bash]
+
+  - name: railway_api_volume_delete
+    pattern: '(api\.railway\.app|railway\.com/graphql).*\b(deleteVolume|volumeDelete|volume_delete)\b'
+    reason: "Railway API call to delete a volume"
+    applies_to: [Bash, WebFetch]
+
+  - name: railway_project_delete
+    pattern: 'railway\s+(project|environment)\s+delete'
+    reason: "Railway project/environment deletion"
+    applies_to: [Bash]
+
+  # Kubernetes
+  - name: kubectl_delete_namespace
+    pattern: 'kubectl\s+(delete|destroy)\s+(namespace|ns)\b'
+    reason: "Kubernetes namespace deletion"
+    applies_to: [Bash]
+
+  - name: kubectl_delete_all
+    pattern: 'kubectl\s+delete\s+(all\s+--all|--all\s+--all-namespaces)'
+    reason: "Kubernetes mass delete"
+    applies_to: [Bash]
+
+  # Terraform / OpenTofu
+  - name: terraform_destroy_auto
+    pattern: '\b(terraform|tofu)\s+destroy\s+.*-auto-approve'
+    reason: "Terraform/OpenTofu destroy with auto-approve"
+    applies_to: [Bash]
+
+  - name: terraform_apply_auto_destroy
+    pattern: '\b(terraform|tofu)\s+apply\s+.*-destroy.*-auto-approve'
+    reason: "Terraform destroy via apply -destroy -auto-approve"
+    applies_to: [Bash]
+
+  # Cloud platform - root-level destruction
+  - name: aws_delete_bucket_force
+    pattern: 'aws\s+s3\s+rb\s+.*--force'
+    reason: "AWS S3 force-delete bucket"
+    applies_to: [Bash]
+
+  - name: gcloud_project_delete
+    pattern: 'gcloud\s+projects\s+delete'
+    reason: "GCP project deletion"
+    applies_to: [Bash]
+
+  - name: flyctl_apps_destroy
+    pattern: 'fly(ctl)?\s+apps?\s+destroy'
+    reason: "Fly.io app destroy"
+    applies_to: [Bash]
+
+  - name: heroku_apps_destroy
+    pattern: 'heroku\s+apps?:destroy'
+    reason: "Heroku app destroy"
+    applies_to: [Bash]
+
+  # Privilege escalation patterns
+  - name: chmod_777_recursive
+    pattern: 'chmod\s+-R\s+777\s+/'
+    reason: "Recursive chmod 777 from root"
+    applies_to: [Bash]
+
+  - name: curl_pipe_sh_root
+    pattern: 'curl\s+.*\|\s*sudo\s+(bash|sh)'
+    reason: "curl piped to sudo shell"
+    applies_to: [Bash]
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# SOFT MATCH - yellow flags that trigger judge evaluation
+# These are commonly-occurring patterns that need contextual evaluation.
+# ─────────────────────────────────────────────────────────────────────────
+soft_match:
+  # Generic destructive verbs. Bash-only — without this scope, every Edit/Write
+  # whose file_path contains "delete" would burn a judge call.
+  - name: destructive_keyword
+    pattern: '\b(delete|destroy|drop|wipe|purge|truncate)\b'
+    reason: "Contains destructive keyword"
+    applies_to: [Bash]
+
+  # Curl to known infrastructure APIs (catches the Railway-style bypass)
+  - name: curl_infrastructure_api
+    pattern: 'curl\s+.*(api\.railway\.app|railway\.com/graphql|api\.vercel\.com|api\.fly\.io|api\.heroku\.com|api\.digitalocean\.com|api\.linode\.com)'
+    reason: "HTTP call to infrastructure provider API"
+    applies_to: [Bash]
+
+  # Same vector but via the WebFetch tool rather than a Bash curl.
+  - name: webfetch_infrastructure_api
+    pattern: '(api\.railway\.app|railway\.com/graphql|api\.vercel\.com|api\.fly\.io|api\.heroku\.com|api\.digitalocean\.com|api\.linode\.com)'
+    reason: "WebFetch to infrastructure provider API"
+    applies_to: [WebFetch]
+
+  # Recursive removal (less catastrophic than rm -rf /)
+  - name: rm_recursive
+    pattern: 'rm\s+-[rR][fF]?\b'
+    reason: "Recursive rm"
+    applies_to: [Bash]
+
+  # AWS / GCP / Azure delete operations
+  - name: aws_delete_op
+    pattern: 'aws\s+\w+\s+(delete-|terminate-|remove-)'
+    reason: "AWS CLI destructive operation"
+    applies_to: [Bash]
+
+  - name: gcloud_delete_op
+    pattern: 'gcloud\s+\w+\s+\w+\s+delete\b'
+    reason: "GCP CLI destructive operation"
+    applies_to: [Bash]
+
+  - name: az_delete_op
+    pattern: 'az\s+\w+\s+delete\b'
+    reason: "Azure CLI destructive operation"
+    applies_to: [Bash]
+
+  # Database - non-DROP destructive ops
+  - name: sql_delete_no_where
+    pattern: '\bDELETE\s+FROM\s+\w+\s*(;|$)'
+    reason: "SQL DELETE without WHERE clause"
+    applies_to: [Bash]
+
+  # Docker / container ops
+  - name: docker_system_prune
+    pattern: 'docker\s+(system\s+)?prune\s+.*(-a|--all|--volumes)'
+    reason: "Aggressive docker prune"
+    applies_to: [Bash]
+
+  - name: docker_rm_force
+    pattern: 'docker\s+(container\s+)?rm\s+.*-f'
+    reason: "Force docker container removal"
+    applies_to: [Bash]
+
+  # Git - less catastrophic but still risky
+  - name: git_clean_force
+    pattern: 'git\s+clean\s+.*-[fdx]'
+    reason: "git clean with force/dirs/ignored"
+    applies_to: [Bash]
+
+  - name: git_branch_delete
+    pattern: 'git\s+(branch|push)\s+.*(-D|--delete)'
+    reason: "Git branch/remote deletion"
+    applies_to: [Bash]
+
+  # Kubernetes - non-namespace deletes
+  - name: kubectl_delete_resource
+    pattern: 'kubectl\s+delete\s+(deployment|statefulset|pvc|persistentvolume|secret)\b'
+    reason: "Kubernetes resource deletion"
+    applies_to: [Bash]
+
+  # Direct DB connections to non-localhost
+  - name: psql_remote
+    pattern: 'psql\s+.*-h\s+(?!localhost|127\.0\.0\.1)'
+    reason: "psql connection to remote host"
+    applies_to: [Bash]
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# RULES FOR JUDGE - plain-language rules the LLM judge enforces
+# Keep these focused. The judge has NO context beyond the command itself
+# and these rules. Bias toward narrow, unambiguous rules.
+#
+# Note: the system prompt containing these rules is sent with prompt-caching
+# enabled. Once the list grows past the model's cache minimum, repeat judge
+# calls within the cache TTL stop re-billing the rule list each time.
+# ─────────────────────────────────────────────────────────────────────────
+rules_for_judge:
+  - "DENY any operation that deletes, destroys, or wipes data, volumes, databases, or infrastructure resources without explicit per-operation user permission."
+  - "DENY any operation targeting production environments, production hostnames, or resources with 'prod', 'production', or 'live' in their identifiers."
+  - "DENY irreversible operations on shared or persistent resources."
+  - "ESCALATE any operation whose blast radius is unclear from the command alone (e.g., a delete where the target's scope cannot be determined)."
+  - "ESCALATE any operation that touches authentication tokens, credentials, or secrets in a way that could leak or destroy them."
+  - "ESCALATE HTTP calls to infrastructure provider APIs that could be destructive based on the payload."
+  - "ALLOW operations clearly scoped to local files in /tmp, build artifacts, dependency caches, or test fixtures."
+  - "ALLOW read-only operations even if they touch production resources."
