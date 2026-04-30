@@ -1,4 +1,4 @@
-# DoubleAgent - A Coding Agent Guardrail, by Vole Apps
+# DoubleAgent - A Coding Agent Guardrail, by [Vole Apps](https://voleapps.com)
 
 A safety hook for autonomous coding agents. Sits between the agent and the tool
 execution layer, so destructive operations get caught even when the agent has
